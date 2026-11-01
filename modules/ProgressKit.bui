@@ -1,0 +1,305 @@
+''' One-way cooperative cancellation; requesting never stops or completes work.
+Public Class ProgressCancellationToken
+    Private Property mRequested As Atomic
+
+    Public Sub Constructor()
+        mRequested = New Atomic(0)
+    End Sub
+
+    Public Sub Request()
+        mRequested.Store(1)
+    End Sub
+
+    Public Property IsRequested As Boolean
+        Get
+            Return mRequested.Load() <> 0
+        End Get
+    End Property
+End Class
+
+''' Detached immutable view of one node and its descendants.
+Public Class ProgressSnapshot
+    Private Property mFraction As Double
+    Private Property mMessage As String
+    Private Property mOutcome As String
+    Private Property mStarted As Boolean
+    Private Property mUnknown As Boolean
+    Private Property mCancellation As Boolean
+
+    Internal Sub Constructor(fraction As Double, message As String, outcome As String, started As Boolean, unknown As Boolean, cancellation As Boolean)
+        mFraction = fraction
+        mMessage = message
+        mOutcome = outcome
+        mStarted = started
+        mUnknown = unknown
+        mCancellation = cancellation
+    End Sub
+
+    Public Property Fraction As Double
+        Get
+            Return mFraction
+        End Get
+    End Property
+
+    Public Property Message As String
+        Get
+            Return mMessage
+        End Get
+    End Property
+
+    Public Property Outcome As String
+        Get
+            Return mOutcome
+        End Get
+    End Property
+
+    Public Property IsStarted As Boolean
+        Get
+            Return mStarted
+        End Get
+    End Property
+
+    Public Property IsIndeterminate As Boolean
+        Get
+            Return mUnknown
+        End Get
+    End Property
+
+    Public Property IsFinished As Boolean
+        Get
+            Return mOutcome = "succeeded" Or mOutcome = "failed" Or mOutcome = "cancelled"
+        End Get
+    End Property
+
+    Public Property IsComplete As Boolean
+        Get
+            Return mOutcome = "succeeded"
+        End Get
+    End Property
+
+    Public Property IsCancellationRequested As Boolean
+        Get
+            Return mCancellation
+        End Get
+    End Property
+End Class
+
+Private Class ProgressRecord
+    Public Property Children As Array Of Integer = []
+    Public Property Weights As Array Of Double = []
+    Public Property Depth As Integer
+    Public Property Fraction As Double = 0.0
+    Public Property Known As Boolean = False
+    Public Property Outcome As String = "running"
+    Public Property Message As String
+
+    Public Sub Constructor(depth As Integer, message As String)
+        Me.Depth = depth
+        Me.Message = message
+    End Sub
+End Class
+
+Private Class ProgressStore
+    Public Property Gate As Mutex
+    Public Property Records As Array Of ProgressRecord = []
+    Public Property Started As Boolean = False
+    Public Property Token As ProgressCancellationToken
+    Public Property MaxNodes As Integer
+    Public Property MaxDepth As Integer
+
+    Public Sub Constructor(message As String, maxNodes As Integer, maxDepth As Integer)
+        Gate = New Mutex()
+        Token = New ProgressCancellationToken()
+        Me.MaxNodes = maxNodes
+        Me.MaxDepth = maxDepth
+        Array.Append(Records, New ProgressRecord(0, message))
+    End Sub
+
+    ' Caller holds Gate; recursion never acquires it again.
+    Public Function Summarize(index As Integer, cancellation As Boolean) As ProgressSnapshot
+        Dim record As ProgressRecord = Records(index)
+        If Array.Count(record.Children) = 0 Then
+            Dim outcome As String = record.Outcome
+            If Not Started Then outcome = "pending"
+            Dim fraction As Double = record.Fraction
+            If Not record.Known Then fraction = 0.0
+            Return New ProgressSnapshot(fraction, record.Message, outcome, Started, Not record.Known, cancellation)
+        End If
+
+        Dim fraction As Double = 0.0
+        Dim unknown As Boolean = False
+        Dim allFinished As Boolean = True
+        Dim failed As Boolean = False
+        Dim cancelled As Boolean = False
+        Dim message As String = record.Message
+        For i As Integer = 0 To Array.Count(record.Children) - 1
+            Dim child As ProgressSnapshot = Me.Summarize(record.Children(i), cancellation)
+            fraction += child.Fraction * record.Weights(i)
+            unknown = unknown Or child.IsIndeterminate
+            allFinished = allFinished And child.IsFinished
+            failed = failed Or child.Outcome = "failed"
+            cancelled = cancelled Or child.Outcome = "cancelled"
+            If message = "" Then message = child.Message
+        Next
+        ' Roundoff can put a mathematically normalized sum just outside 0..1.
+        If fraction < 0.0 Then fraction = 0.0
+        If fraction > 1.0 Then fraction = 1.0
+        Dim outcome As String = "pending"
+        If Started Then outcome = "running"
+        If allFinished Then
+            outcome = "succeeded"
+            If cancelled Then outcome = "cancelled"
+            If failed Then outcome = "failed"
+            If outcome = "succeeded" Then fraction = 1.0
+        End If
+        Return New ProgressSnapshot(fraction, message, outcome, Started, unknown, cancellation)
+    End Function
+End Class
+
+Private Sub ValidateProgressMessage(message As String)
+    If String.LenBytes(message) > 4096 Then Throw New InvalidArgumentException("Progress message exceeds 4096 UTF-8 bytes")
+End Sub
+
+''' Fixed-topology weighted progress with thread-safe reports and snapshots.
+Public Class ProgressNode
+    Private Property mStore As ProgressStore
+    Private Property mIndex As Integer
+
+    Public Sub Constructor(message As String = "", maxNodes As Integer = 10000, maxDepth As Integer = 64)
+        ValidateProgressMessage(message)
+        If maxNodes < 1 Or maxNodes > 100000 Then Throw New InvalidArgumentException("Progress maxNodes must be in 1..100000")
+        If maxDepth < 0 Or maxDepth > 64 Then Throw New InvalidArgumentException("Progress maxDepth must be in 0..64")
+        mStore = New ProgressStore(message, maxNodes, maxDepth)
+        mIndex = 0
+    End Sub
+
+    Internal Sub Constructor(store As ProgressStore, index As Integer)
+        mStore = store
+        mIndex = index
+    End Sub
+
+    Public Property Cancellation As ProgressCancellationToken
+        Get
+            Return mStore.Token
+        End Get
+    End Property
+
+    ''' Split a leaf once before Start; returned handles retain the shared tree.
+    Public Function Split(weights As Array Of Double) As Array Of ProgressNode
+        SyncLock mStore.Gate
+            If mStore.Started Then Throw New InvalidArgumentException("Progress topology is frozen after Start")
+            Dim record As ProgressRecord = mStore.Records(mIndex)
+            If Array.Count(record.Children) <> 0 Then Throw New InvalidArgumentException("Progress node was already split")
+            Dim count As Integer = Array.Count(weights)
+            If count = 0 Then Throw New InvalidArgumentException("Progress Split requires positive weights")
+            If count > mStore.MaxNodes - Array.Count(mStore.Records) Then Throw New InvalidArgumentException("Progress node limit reached")
+            If record.Depth >= mStore.MaxDepth Then Throw New InvalidArgumentException("Progress depth limit reached")
+            Dim largest As Double = 0.0
+            For Each weight As Double In weights
+                If Not (weight > 0.0 And weight <= 1.7976931348623157e308) Then Throw New InvalidArgumentException("Progress weights must be finite and positive")
+                If weight > largest Then largest = weight
+            Next
+            Dim normalized As Array Of Double = []
+            Dim total As Double = 0.0
+            For Each weight As Double In weights
+                Dim scaled As Double = weight / largest
+                If scaled <= 0.0 Then Throw New InvalidArgumentException("Progress weight ratio underflows")
+                Array.Append(normalized, scaled)
+                total += scaled
+            Next
+            For i As Integer = 0 To count - 1
+                normalized(i) = normalized(i) / total
+                If normalized(i) <= 0.0 Then Throw New InvalidArgumentException("Normalized progress weight underflows")
+            Next
+
+            Dim children As Array Of Integer = []
+            Dim handles As Array Of ProgressNode = []
+            For i As Integer = 0 To count - 1
+                Dim index As Integer = Array.Count(mStore.Records)
+                Array.Append(mStore.Records, New ProgressRecord(record.Depth + 1, ""))
+                Array.Append(children, index)
+                Array.Append(handles, New ProgressNode(mStore, index))
+            Next
+            record.Children = children
+            record.Weights = normalized
+            Return handles
+        End SyncLock
+    End Function
+
+    ''' Only the root may start; repeated root starts are harmless.
+    Public Sub Start()
+        If mIndex <> 0 Then Throw New InvalidArgumentException("Only the progress root may Start")
+        SyncLock mStore.Gate
+            mStore.Started = True
+        End SyncLock
+    End Sub
+
+    Private Function WritableLeaf() As ProgressRecord
+        If Not mStore.Started Then Throw New InvalidArgumentException("Progress must Start before reporting")
+        Dim record As ProgressRecord = mStore.Records(mIndex)
+        If Array.Count(record.Children) <> 0 Then Throw New InvalidArgumentException("Only progress leaves may report or finish")
+        Return record
+    End Function
+
+    Public Sub Report(fraction As Double, message As String = "")
+        ValidateProgressMessage(message)
+        If Not (fraction >= 0.0 And fraction <= 1.0) Then Throw New InvalidArgumentException("Progress fraction must be finite and in 0..1")
+        SyncLock mStore.Gate
+            Dim record As ProgressRecord = Me.WritableLeaf()
+            If record.Outcome <> "running" Then Throw New InvalidArgumentException("Finished progress cannot report")
+            record.Fraction = fraction
+            record.Known = True
+            record.Message = message
+        End SyncLock
+    End Sub
+
+    Public Sub ReportUnknown(message As String = "")
+        ValidateProgressMessage(message)
+        SyncLock mStore.Gate
+            Dim record As ProgressRecord = Me.WritableLeaf()
+            If record.Outcome <> "running" Then Throw New InvalidArgumentException("Finished progress cannot report")
+            record.Known = False
+            record.Message = message
+        End SyncLock
+    End Sub
+
+    Private Sub Finish(outcome As String, message As String)
+        ValidateProgressMessage(message)
+        SyncLock mStore.Gate
+            Dim record As ProgressRecord = Me.WritableLeaf()
+            If record.Outcome = outcome Then Exit Sub
+            If record.Outcome <> "running" Then Throw New InvalidArgumentException("Progress already finished with a different outcome")
+            record.Outcome = outcome
+            record.Known = True
+            record.Message = message
+            If outcome = "succeeded" Then record.Fraction = 1.0
+        End SyncLock
+    End Sub
+
+    Public Sub Complete(message As String = "")
+        Me.Finish("succeeded", message)
+    End Sub
+
+    Public Sub Fail(message As String)
+        Me.Finish("failed", message)
+    End Sub
+
+    Public Sub Cancel(message As String = "")
+        Me.Finish("cancelled", message)
+    End Sub
+
+    Public Sub SetMessage(message As String)
+        ValidateProgressMessage(message)
+        SyncLock mStore.Gate
+            If mStore.Summarize(mIndex, False).IsFinished Then Throw New InvalidArgumentException("Finished progress cannot change message")
+            Dim record As ProgressRecord = mStore.Records(mIndex)
+            record.Message = message
+        End SyncLock
+    End Sub
+
+    Public Function Snapshot() As ProgressSnapshot
+        SyncLock mStore.Gate
+            Return mStore.Summarize(mIndex, mStore.Token.IsRequested)
+        End SyncLock
+    End Function
+End Class
