@@ -1,1 +1,1 @@
-{"schema":1,"name":"progresskit","version":"0.1.0","description":"Bounded weighted progress trees, immutable snapshots and cooperative cancellation"}
+{"schema":1,"name":"progresskit","version":"0.1.0","description":"Track weighted progress trees and cooperative cancellation"}
