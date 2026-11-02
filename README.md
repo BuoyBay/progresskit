@@ -1,4 +1,4 @@
-# Track weighted progress trees and cooperative cancellation
+# Weighted progress trees and cooperative cancel
 
 `Import progresskit` adds headless weighted progress trees, detached immutable
 snapshots and one-way cooperative cancellation. Reports and snapshots are safe
