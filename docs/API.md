@@ -95,5 +95,3 @@ controlling the terminal status. The model performs no UI dispatch, throttling,
 automatic scheduling or observer callbacks. It does not implement pause/kill,
 dynamic topology, persistence, result payloads, or exception propagation from
 workers; callers translate their worker outcomes to Complete/Fail/Cancel.
-
-Maintainers run the private validation suite before release. See the repository README for public build instructions.

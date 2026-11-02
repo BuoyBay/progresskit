@@ -33,6 +33,4 @@ Call the shared Cancellation.Request and have workers check IsRequested. A
 request alone never makes a node terminal. Release worker-owned resources before
 acknowledging Cancel; keep worker inputs alive until their threads have exited.
 
-The project includes a checked console example at
-`examples/andrewkeller/progress/main.bui` and the focused verifier
-`tests/keller_progress_verify.py`.
+Use progress trees to combine weighted subtask completion into a single reported fraction.
